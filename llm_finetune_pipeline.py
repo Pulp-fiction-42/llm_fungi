@@ -3,10 +3,13 @@ import torch
 import wandb
 import yaml
 import numpy as np
+import pandas as pd
 import sklearn.metrics as metrics
+from tqdm import tqdm
 from transformers import (
     AutoModel,
     AutoTokenizer,
+    AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
     DataCollatorWithPadding
@@ -20,7 +23,7 @@ from peft import (
     TaskType,
     PeftType
 )
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, DatasetDict
 import optuna
 
 # ==============================================================================
@@ -132,18 +135,45 @@ class PEFTExperiment:
         return configs[method.lower()]
     
     def prepare_data(self):
-        """准备数据集"""
-        dataset = load_dataset(self.dataset_name)
+        """准备数据集，从parsed_genome.csv文件加载"""
+        # 从CSV文件加载数据
+        df = pd.read_csv('parsed_genome.csv')
+        
+        # 将数据转换为Hugging Face Dataset格式
+        # 使用'contig'列作为文本输入，'organism_name'列作为标签
+        train_df = df.sample(frac=0.8, random_state=42)
+        val_df = df.drop(train_df.index)
+        
+        # 创建标签到ID的映射
+        unique_labels = df['organism_name'].unique().tolist()
+        label_to_id = {label: i for i, label in enumerate(unique_labels)}
+        
+        # 添加标签ID列
+        train_df['label'] = train_df['organism_name'].map(label_to_id)
+        val_df['label'] = val_df['organism_name'].map(label_to_id)
+        
+        dataset_dict = {
+            'train': Dataset.from_pandas(train_df),
+            'validation': Dataset.from_pandas(val_df)
+        }
+        
+        # 创建一个Dataset对象
+        dataset = DatasetDict(dataset_dict)
         
         def tokenize_function(examples):
+            # 使用'contig'列作为文本输入，不使用截断和填充
             return self.tokenizer(
-                examples["text"] if "text" in examples else examples["sentence"],
-                truncation=True,
-                padding=False,
-                max_length=512
+                examples["contig"],
+                truncation=False,
+                padding=False
             )
         
         tokenized_dataset = dataset.map(tokenize_function, batched=True)
+        
+        # 保存标签映射信息，方便后续预测时使用
+        self.label_to_id = label_to_id
+        self.id_to_label = {i: label for label, i in label_to_id.items()}
+        
         return tokenized_dataset
     
     def train_with_peft(self, peft_method, peft_params, training_params):
@@ -151,8 +181,8 @@ class PEFTExperiment:
 
         # 初始化wandb
         run = wandb.init(
-            project="DNA_LLM_finetune",
-            name=f"{peft_method}_{self.model_name}_{self.dataset_name}",
+            project="fungi_LLM_finetune",
+            name=f"{peft_method}_{self.model_name}_{self.dataset_name}_{run.id}",
             config={
                 "model": self.model_name,
                 "peft_method": peft_method,
@@ -161,47 +191,66 @@ class PEFTExperiment:
             }
         )
         
-        # 加载模型
-        model = AutoModel.from_pretrained(
-            self.model_name,
-            num_labels=2  # 根据任务调整
-        )
+        # 准备数据
+        dataset = self.prepare_data()# 返回tokenized_dataset
         
+        # 获取标签数量
+        num_labels = len(self.label_to_id)
+        print(f"分类任务标签数量: {num_labels}")
+        print(f"标签映射: {self.label_to_id}")
+        
+        # 加载模型
+        model = AutoModelForSequenceClassification.from_pretrained(
+            self.model_name,
+            num_labels=num_labels  # 根据organism_name的唯一值数量设置
+        )   
         # 应用PEFT配置
         peft_config = self.get_peft_config(peft_method, **peft_params)
         model = get_peft_model(model, peft_config)#应用配置后的PEFT模型
         
-        # 准备数据
-        dataset = self.prepare_data()
-        data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)#动态padding一个batch中的所有样本
+        # 自定义数据整理器，使用原始token序列，不进行填充
+        def custom_data_collator(features):
+            # 只将input_ids和labels收集到一起，不进行填充操作
+            batch = {}
+            batch["input_ids"] = [feature["input_ids"] for feature in features]
+            batch["attention_mask"] = [feature["attention_mask"] for feature in features]
+            batch["labels"] = torch.tensor([feature["label"] for feature in features])
+            return batch
         
         # 训练参数
         training_args = TrainingArguments(
-            output_dir=f"./results/{peft_method}_{run.id}",
+            output_dir=f"./llm_fne_tune_results/{peft_method}_{self.model_name}_{self.dataset_name}_{run.id}",
+
             learning_rate=training_params.get("learning_rate"),
-            per_device_train_batch_size=training_params.get("batch_size"),
+            per_device_train_batch_size=1,  # 设置为1以避免批处理问题
             num_train_epochs=training_params.get("epochs"),
-            weight_decay=training_params.get("weight_decay"),
-            logging_steps=10,
+            #weight_decay=training_params.get("weight_decay"),
+
+            logging_steps=100,
             evaluation_strategy="epoch",# 定义evaluation时机
             save_strategy="epoch",# 定义模型保存时机
             load_best_model_at_end=True,# 确保训练结束时加载表现最佳的模型
             metric_for_best_model="eval_loss",# 评判保存的标准
             save_total_limit=1,# 每当新检查点保存时会删除旧检查点
-            report_to="wandb"
+            
+            report_to="wandb",
+            disable_tqdm=False  # 确保不禁用tqdm进度条
         )
         
         # Define a compute_metrics function to calculate and log metrics during training
         def compute_metrics(eval_pred):
             logits, labels = eval_pred
             predictions = np.argmax(logits, axis=-1)
-            precision, recall, f1, _ = metrics.precision_recall_fscore_support(labels, predictions, average='binary')
-            acc = metrics.accuracy_score(labels, predictions)
+            
+            # 多分类评估
+            accuracy = metrics.accuracy_score(labels, predictions)
+            f1_macro = metrics.f1_score(labels, predictions, average='macro')
+            f1_weighted = metrics.f1_score(labels, predictions, average='weighted')
+            
             return {
-                'accuracy': acc,
-                'f1': f1,
-                'precision': precision,
-                'recall': recall
+                'accuracy': accuracy,
+                'f1_macro': f1_macro,
+                'f1_weighted': f1_weighted
             }
 
         # Initialize the Trainer with compute_metrics
@@ -211,20 +260,40 @@ class PEFTExperiment:
             train_dataset=dataset["train"],
             eval_dataset=dataset["validation"] if "validation" in dataset else dataset["test"],
             tokenizer=self.tokenizer,
-            data_collator=data_collator,
+            data_collator=custom_data_collator,  # 使用自定义数据整理器
             compute_metrics=compute_metrics# metrics for evaluation
         )
 
         # Train the model
         import time
         start_time = time.time()
-        trainer.train()
+        
+        # 使用tqdm显示训练进度
+        print("\n开始训练模型...")
+        total_steps = int(len(dataset["train"]) / training_args.per_device_train_batch_size * training_args.num_train_epochs)
+        with tqdm(total=total_steps, desc="训练进度") as pbar:
+            # 创建一个回调函数来更新进度条
+            class TqdmCallback:
+                def __init__(self, pbar):
+                    self.pbar = pbar
+                
+                def on_log(self, args, state, control, logs=None, **kwargs):
+                    if state.is_local_process_zero and logs:
+                        _ = logs.pop("total_flos", None)
+                        if state.global_step > 0:
+                            self.pbar.update(1)
+            
+            # 添加回调函数到trainer
+            trainer.add_callback(TqdmCallback(pbar))
+            trainer.train()
+        
         training_time = time.time() - start_time
 
         # Log the training time and number of trainable parameters
         wandb.log({
             "trainable_params": model.get_nb_trainable_parameters(),
-            "training_time": training_time
+            "training_time": training_time,
+            "num_labels": num_labels
         })
 
         wandb.finish()

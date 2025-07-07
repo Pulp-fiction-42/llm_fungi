@@ -2,8 +2,8 @@
 #  实验基本配置
 # ==============================================================================
 experiment:
-  model_name: "bert-base-uncased"
-  dataset_name: "imdb"
+  model_name: "zhihan1996/DNABERT-2-117M"
+  dataset_name: "parsed_genome.csv"
   task_type: "sequence_classification"
 
 # ==============================================================================
@@ -23,7 +23,7 @@ peft:
 training:
   learning_rate: 5e-4
   batch_size: 16
-  epochs: 3
+  epochs: 10
   #weight_decay: 0.01
 
 # ==============================================================================

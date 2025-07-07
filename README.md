@@ -9,11 +9,12 @@
 - 支持单次训练和超参数优化两种模式
 - 使用Optuna进行高效超参数优化
 - 与Weights & Biases集成，用于实验跟踪
+- 支持使用本地CSV文件作为训练数据集
 
 ## 安装依赖
 
 ```bash
-pip install torch transformers datasets peft optuna wandb pyyaml
+pip install torch transformers datasets peft optuna wandb pyyaml pandas
 ```
 
 ## 使用方法
@@ -22,13 +23,18 @@ pip install torch transformers datasets peft optuna wandb pyyaml
 
 创建一个YAML格式的配置文件，例如`config.yaml`，设置模型、数据集和训练参数。可参考提供的示例配置文件。
 
-### 2. 运行单次训练
+### 2. 准备数据集
+
+本项目支持使用本地CSV文件作为训练数据集。CSV文件应包含至少一个名为`contig`的列，作为模型的输入文本。
+当前项目使用`parsed_genome.csv`作为训练数据集。
+
+### 3. 运行单次训练
 
 ```bash
 python llm_finetune_pipeline.py --config config.yaml --mode train
 ```
 
-### 3. 运行超参数优化
+### 4. 运行超参数优化
 
 ```bash
 python llm_finetune_pipeline.py --config config.yaml --mode tune
@@ -50,7 +56,7 @@ python llm_finetune_pipeline.py --config config.yaml --mode tune
 # 实验基本配置
 experiment:
   model_name: "bert-base-uncased"
-  dataset_name: "imdb"
+  dataset_name: "parsed_genome.csv"  # 使用本地CSV文件
   task_type: "sequence_classification"
 
 # PEFT方法配置
@@ -75,4 +81,5 @@ training:
 
 - 确保已安装所有依赖包
 - 使用超参数优化前建议设置wandb账号，以便跟踪实验结果
-- 对于大型模型，请确保有足够的GPU内存 
+- 对于大型模型，请确保有足够的GPU内存
+- 使用本地CSV文件时，确保文件格式正确并包含必要的列 
