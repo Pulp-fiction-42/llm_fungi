@@ -2,20 +2,20 @@
 #  实验基本配置
 # ==============================================================================
 experiment:
-  model_name: "zhihan1996/DNABERT-2-117M"
+  model_name: "./DNABERT-2-117M"
   dataset_name: "parsed_genome.csv"
-  task_type: "sequence_classification"
+  task_type: "SEQ_CLS"
 
 # ==============================================================================
 #  PEFT方法配置（用于单次训练）
 # ==============================================================================
 peft:
-  method: "lora"
+  method: lora
   params:
-    r: 16
+    r: 8
     lora_alpha: 32
     lora_dropout: 0.1
-    target_modules: ["q_proj", "v_proj"]
+    target_modules: "bert.encoder.layer.*.attention.self.Wqkv"      # 注意力机制的QKV线性层
 
 # ==============================================================================
 #  训练超参数配置（用于单次训练）

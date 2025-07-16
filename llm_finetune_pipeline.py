@@ -1,6 +1,5 @@
 import os
 import torch
-import wandb
 import yaml
 import numpy as np
 import pandas as pd
@@ -25,6 +24,26 @@ from peft import (
 )
 from datasets import load_dataset, Dataset, DatasetDict
 import optuna
+import pickle
+import gc
+import time
+
+# 辅助函数，用于保存CUDA内存快照
+def save_memory_snapshot(filename=None):
+    """保存CUDA内存快照到文件中"""
+    if not torch.cuda.is_available():
+        print("CUDA不可用，无法保存内存快照")
+        return
+        
+    filename = filename or f"memory_snapshot_{time.strftime('%Y%m%d_%H%M%S')}.pickle"
+    snapshot = torch.cuda.memory._snapshot()
+    with open(filename, 'wb') as f:
+        pickle.dump(snapshot, f)
+    print(f"内存快照已保存至 {filename}")
+    print("\n--- 内存快照摘要 ---")
+    print(torch.cuda.memory_summary())
+    print("---------------------------\n")
+    print(f"您可以在 https://pytorch.org/memory_viz 上查看内存快照详情")
 
 # ==============================================================================
 #  ConfigParser类用于解析YAML配置文件
@@ -91,11 +110,14 @@ class ConfigParser:
 #  PEFTExperiment类用于执行PEFT训练和评估
 # ==============================================================================
 class PEFTExperiment:
-    def __init__(self, model_name, dataset_name, task_type):
+    def __init__(self, model_name, dataset_name, task_type, config):
         self.model_name = model_name
         self.dataset_name = dataset_name
         self.task_type = task_type
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.config = config
+        # 从本地目录加载tokenizer
+        print(f"从本地目录加载tokenizer: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
         
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -117,27 +139,36 @@ class PEFTExperiment:
                 inference_mode=False,
                 target_modules=kwargs.get("target_modules"),
                 feedforward_modules=kwargs.get("feedforward_modules")
-            ),
-            "adalora": AdaLoraConfig(
-                task_type=self.task_type,
-                inference_mode=False,
-                r=kwargs.get("r"),
-                lora_alpha=kwargs.get("lora_alpha"),
-                target_r=kwargs.get("target_r"),
-                init_r=kwargs.get("init_r"),
-                tinit=kwargs.get("tinit"),
-                tfinal=kwargs.get("tfinal"),
-                deltaT=kwargs.get("deltaT"),
-                lora_dropout=kwargs.get("lora_dropout"),
-                target_modules=kwargs.get("target_modules")
             )
         }
         return configs[method.lower()]
     
     def prepare_data(self):
         """准备数据集，从parsed_genome.csv文件加载"""
+        print("开始准备数据...")
         # 从CSV文件加载数据
         df = pd.read_csv('parsed_genome.csv')
+        
+        # 计算并记录序列长度信息
+        if 'contig' in df.columns:
+            df['sequence_length'] = df['contig'].str.len()
+            max_length = df['sequence_length'].max()
+            avg_length = df['sequence_length'].mean()
+            print(f"数据集序列长度统计: 最大长度={max_length}, 平均长度={avg_length}")
+            
+            # 记录序列长度分布
+            length_bins = [0, 512, 1024, 2048, 4096, 8192, 16384, float('inf')]
+            length_counts = [((df['sequence_length'] > length_bins[i]) & (df['sequence_length'] <= length_bins[i+1])).sum() 
+                            for i in range(len(length_bins)-1)]
+            length_labels = [f"{length_bins[i]}-{length_bins[i+1]}" for i in range(len(length_bins)-1)]
+            
+            print("序列长度分布:")
+            for label, count in zip(length_labels, length_counts):
+                print(f"  {label}: {count} 条序列")
+                
+            # 找出最长的序列并记录其ID和长度
+            longest_seq_idx = df['sequence_length'].idxmax()
+            print(f"最长序列ID: {longest_seq_idx}, 长度: {df.loc[longest_seq_idx, 'sequence_length']}")
         
         # 将数据转换为Hugging Face Dataset格式
         # 使用'contig'列作为文本输入，'organism_name'列作为标签
@@ -152,6 +183,10 @@ class PEFTExperiment:
         train_df['label'] = train_df['organism_name'].map(label_to_id)
         val_df['label'] = val_df['organism_name'].map(label_to_id)
         
+        # 打印调试信息
+        print(f"标签类型: {train_df['label'].dtype}")
+        print(f"标签示例: {train_df['label'].iloc[:5].tolist()}")
+        
         dataset_dict = {
             'train': Dataset.from_pandas(train_df),
             'validation': Dataset.from_pandas(val_df)
@@ -160,15 +195,41 @@ class PEFTExperiment:
         # 创建一个Dataset对象
         dataset = DatasetDict(dataset_dict)
         
+        # 使用profiler分析tokenize过程
         def tokenize_function(examples):
-            # 使用'contig'列作为文本输入，不使用截断和填充
-            return self.tokenizer(
+            # 使用较小的max_length来避免OOM
+            max_length = 512  # 降低此值以减少内存使用，可以根据您的数据集和GPU内存调整
+            
+            # 使用'contig'列作为文本输入，启用截断和填充以防止OOM
+            result = self.tokenizer(
                 examples["contig"],
-                truncation=False,
-                padding=False
+                truncation=True,
+                padding="max_length",
+                max_length=max_length
             )
+            
+            # 确保标签字段名称正确
+            if "label" in examples:
+                result["labels"] = examples["label"]  # 保持标签为整型
+            return result
         
-        tokenized_dataset = dataset.map(tokenize_function, batched=True)
+        print("开始tokenize数据...")
+        # 记录tokenize前的内存
+        if torch.cuda.is_available():
+            before_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"Tokenize前内存使用: {before_mem:.2f} MB")
+
+        # 执行tokenize操作
+        tokenized_dataset = dataset.map(tokenize_function, batched=True, batch_size=32)
+        
+        # 记录tokenize后的内存
+        if torch.cuda.is_available():
+            after_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"Tokenize后内存使用: {after_mem:.2f} MB")
+            print(f"Tokenize过程内存增加: {after_mem - before_mem:.2f} MB")
+        
+        # 打印处理后的数据集信息
+        print(f"处理后的数据集结构: {tokenized_dataset}")
         
         # 保存标签映射信息，方便后续预测时使用
         self.label_to_id = label_to_id
@@ -178,65 +239,106 @@ class PEFTExperiment:
     
     def train_with_peft(self, peft_method, peft_params, training_params):
         """使用PEFT方法训练模型"""
-
-        # 初始化wandb
-        run = wandb.init(
-            project="fungi_LLM_finetune",
-            name=f"{peft_method}_{self.model_name}_{self.dataset_name}_{run.id}",
-            config={
-                "model": self.model_name,
-                "peft_method": peft_method,
-                "peft_params": peft_params,#参数高效微调超参数
-                **training_params#训练超参数
-            }
-        )
+        # 为TensorBoard创建日志目录
+        log_dir = f"./tensorboard_logs/{peft_method}_{self.model_name.split('/')[-1]}_{self.dataset_name}"
+        os.makedirs(log_dir, exist_ok=True)
         
         # 准备数据
-        dataset = self.prepare_data()# 返回tokenized_dataset
+        print("开始数据准备阶段...")
+        dataset = self.prepare_data()
         
         # 获取标签数量
         num_labels = len(self.label_to_id)
         print(f"分类任务标签数量: {num_labels}")
         print(f"标签映射: {self.label_to_id}")
         
-        # 加载模型
+        print("开始加载模型...")
+        # 记录模型加载前的内存
+        if torch.cuda.is_available():
+            before_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"模型加载前内存使用: {before_mem:.2f} MB")
+            
+        # 从本地目录加载模型
         model = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
-            num_labels=num_labels  # 根据organism_name的唯一值数量设置
-        )   
-        # 应用PEFT配置
-        peft_config = self.get_peft_config(peft_method, **peft_params)
-        model = get_peft_model(model, peft_config)#应用配置后的PEFT模型
-        
-        # 自定义数据整理器，使用原始token序列，不进行填充
-        def custom_data_collator(features):
-            # 只将input_ids和labels收集到一起，不进行填充操作
-            batch = {}
-            batch["input_ids"] = [feature["input_ids"] for feature in features]
-            batch["attention_mask"] = [feature["attention_mask"] for feature in features]
-            batch["labels"] = torch.tensor([feature["label"] for feature in features])
-            return batch
-        
-        # 训练参数
-        training_args = TrainingArguments(
-            output_dir=f"./llm_fne_tune_results/{peft_method}_{self.model_name}_{self.dataset_name}_{run.id}",
-
-            learning_rate=training_params.get("learning_rate"),
-            per_device_train_batch_size=1,  # 设置为1以避免批处理问题
-            num_train_epochs=training_params.get("epochs"),
-            #weight_decay=training_params.get("weight_decay"),
-
-            logging_steps=100,
-            evaluation_strategy="epoch",# 定义evaluation时机
-            save_strategy="epoch",# 定义模型保存时机
-            load_best_model_at_end=True,# 确保训练结束时加载表现最佳的模型
-            metric_for_best_model="eval_loss",# 评判保存的标准
-            save_total_limit=1,# 每当新检查点保存时会删除旧检查点
-            
-            report_to="wandb",
-            disable_tqdm=False  # 确保不禁用tqdm进度条
+            num_labels=num_labels,
+            problem_type="single_label_classification",
+            local_files_only=True,
+            trust_remote_code=True
         )
         
+        # 记录模型加载后的内存
+        if torch.cuda.is_available():
+            after_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"模型加载后内存使用: {after_mem:.2f} MB")
+            print(f"模型加载内存增加: {after_mem - before_mem:.2f} MB")
+        
+        # 应用PEFT配置
+        print("应用PEFT配置...")
+        if torch.cuda.is_available():
+            before_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"PEFT应用前内存使用: {before_mem:.2f} MB")
+            
+        peft_config = self.get_peft_config(peft_method, **peft_params)
+        model = get_peft_model(model, peft_config)
+        
+        # 记录PEFT应用后的内存
+        if torch.cuda.is_available():
+            after_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"PEFT应用后内存使用: {after_mem:.2f} MB")
+            print(f"PEFT应用内存增加: {after_mem - before_mem:.2f} MB")
+        
+        # 打印模型参数情况
+        model.print_trainable_parameters()
+        
+        # 使用自定义数据整理器
+        data_collator = DataCollatorWithPadding(tokenizer=self.tokenizer)
+        
+        # 训练参数
+        run_name = f"{peft_method}_{self.model_name}_{self.dataset_name}"
+        training_args = TrainingArguments(
+            output_dir=f"./llm_fne_tune_results/{run_name}",
+            learning_rate=float(training_params.get("learning_rate")),  # 转换为浮点数
+            per_device_train_batch_size=1,  # 设置为1以避免批处理问题
+            num_train_epochs=float(training_params.get("epochs")),  # 转换为浮点数
+            logging_steps=100,
+            save_total_limit=1,
+            report_to="tensorboard",
+            logging_dir=log_dir,
+            disable_tqdm=False
+        )
+        
+        # 创建一个支持PyTorch Profiler的自定义Trainer类
+        class ProfilerTrainer(Trainer):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.step_counter = 0
+                
+            def training_step(self, model, inputs, num_items_in_batch):
+                """使用PyTorch Profiler重写训练步骤"""
+                self.step_counter += 1
+                
+                # 每100步记录一次内存使用情况
+                if self.step_counter % 100 == 1:
+                    # 记录当前的内存使用情况而不是使用profiler
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / (1024 * 1024)
+                        reserved = torch.cuda.memory_reserved() / (1024 * 1024)
+                        max_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)
+                        print(f"\n--- 第{self.step_counter}步训练内存使用 ---")
+                        print(f"已分配内存: {allocated:.2f} MB")
+                        print(f"已预留内存: {reserved:.2f} MB")
+                        print(f"峰值内存使用: {max_mem:.2f} MB")
+                        
+                        # 保存内存快照
+                        save_memory_snapshot(f"step_{self.step_counter}_memory.pickle")
+                
+                # 正常的训练步骤
+                outputs = model(**inputs)
+                loss = outputs.loss
+                loss.backward()
+                return loss.detach()
+
         # Define a compute_metrics function to calculate and log metrics during training
         def compute_metrics(eval_pred):
             logits, labels = eval_pred
@@ -253,50 +355,50 @@ class PEFTExperiment:
                 'f1_weighted': f1_weighted
             }
 
-        # Initialize the Trainer with compute_metrics
-        trainer = Trainer(
+        # Initialize the Trainer with profiler support
+        trainer = ProfilerTrainer(
             model=model,
             args=training_args,
             train_dataset=dataset["train"],
-            eval_dataset=dataset["validation"] if "validation" in dataset else dataset["test"],
-            tokenizer=self.tokenizer,
-            data_collator=custom_data_collator,  # 使用自定义数据整理器
-            compute_metrics=compute_metrics# metrics for evaluation
+            eval_dataset=dataset["validation"],
+            compute_metrics=compute_metrics,
+            data_collator=data_collator,
         )
 
-        # Train the model
-        import time
-        start_time = time.time()
-        
-        # 使用tqdm显示训练进度
-        print("\n开始训练模型...")
-        total_steps = int(len(dataset["train"]) / training_args.per_device_train_batch_size * training_args.num_train_epochs)
-        with tqdm(total=total_steps, desc="训练进度") as pbar:
-            # 创建一个回调函数来更新进度条
-            class TqdmCallback:
-                def __init__(self, pbar):
-                    self.pbar = pbar
-                
-                def on_log(self, args, state, control, logs=None, **kwargs):
-                    if state.is_local_process_zero and logs:
-                        _ = logs.pop("total_flos", None)
-                        if state.global_step > 0:
-                            self.pbar.update(1)
+        # 启用CUDA内存历史记录
+        if torch.cuda.is_available():
+            torch.cuda.memory._record_memory_history(enabled=True)
+            print("\n--- 训练开始，保存内存快照 ---")
+            save_memory_snapshot("start_memory_snapshot.pickle")
             
-            # 添加回调函数到trainer
-            trainer.add_callback(TqdmCallback(pbar))
-            trainer.train()
+        start_time = time.time()
+
+        # 开始训练
+        profiler_enabled = torch.cuda.is_available()
+        if profiler_enabled:
+            print("开始训练，每100步记录一次性能分析...")
+        
+        trainer.train()
+        
+        # 训练完成后生成内存快照
+        if torch.cuda.is_available():
+            print("\n--- 训练完成，保存内存快照 ---")
+            save_memory_snapshot("final_memory_snapshot.pickle")
+            print(f"最大内存使用: {torch.cuda.max_memory_allocated() / (1024 * 1024):.2f} MB")
         
         training_time = time.time() - start_time
+        print(f"训练完成，总用时: {training_time:.2f}秒")
 
-        # Log the training time and number of trainable parameters
-        wandb.log({
-            "trainable_params": model.get_nb_trainable_parameters(),
+        # 记录额外的指标到TensorBoard
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        trainer.log({
+            "trainable_params": trainable_params,
             "training_time": training_time,
             "num_labels": num_labels
         })
-
-        wandb.finish()
+        
+        print(f"\n训练完成! 可以使用以下命令查看训练日志:")
+        print(f"tensorboard --logdir={log_dir}")
         
         return {}
 
@@ -366,22 +468,6 @@ class HyperparameterTuner:
         elif peft_method == "ia3":
             # IA3 没有额外参数
             peft_params = {}
-        else:  # adalora
-            adalora_space = peft_space.get('adalora', {})
-            peft_params = {
-                "r": trial.suggest_int("r", 
-                                      adalora_space.get('r', {}).get('min'), 
-                                      adalora_space.get('r', {}).get('max'), 
-                                      step=adalora_space.get('r', {}).get('step')),
-                "target_r": trial.suggest_int("target_r", 
-                                             adalora_space.get('target_r', {}).get('min'), 
-                                             adalora_space.get('target_r', {}).get('max'), 
-                                             step=adalora_space.get('target_r', {}).get('step')),
-                "lora_alpha": trial.suggest_int("lora_alpha", 
-                                               adalora_space.get('lora_alpha', {}).get('min'), 
-                                               adalora_space.get('lora_alpha', {}).get('max'), 
-                                               step=adalora_space.get('lora_alpha', {}).get('step'))
-            }
             
         # 3. 获取训练参数搜索空间
         training_space = self.search_space.get('training', {})
@@ -432,7 +518,6 @@ class HyperparameterTuner:
         else:
             print("尚未进行任何试验。")
 
-
 if __name__ == "__main__":
     import argparse
     
@@ -440,6 +525,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PEFT模型微调脚本")
     parser.add_argument('--config', type=str, required=True, help='配置文件路径')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'tune'], help='执行模式: train或tune')
+    parser.add_argument('--max_length', type=int, default=512, help='最大序列长度，超过此长度的序列将被截断')
+    parser.add_argument('--analyze_only', action='store_true', help='仅分析数据集，不进行训练')
     args = parser.parse_args()
     
     # 加载配置
@@ -452,8 +539,31 @@ if __name__ == "__main__":
     My_experiment = PEFTExperiment(
         model_name=exp_config['model_name'],
         dataset_name=exp_config['dataset_name'],
-        task_type=exp_config['task_type']
+        task_type=exp_config['task_type'],
+        config=config_parser.config
     )
+    
+    if args.analyze_only:
+        # 只分析数据集不训练
+        print("仅分析数据集...")
+        
+        # 记录开始时的内存
+        if torch.cuda.is_available():
+            before_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"数据分析前内存使用: {before_mem:.2f} MB")
+            
+        dataset = My_experiment.prepare_data()
+        
+        # 记录完成后的内存
+        if torch.cuda.is_available():
+            after_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            print(f"数据分析后内存使用: {after_mem:.2f} MB")
+            print(f"数据分析内存增加: {after_mem - before_mem:.2f} MB")
+            
+            # 记录峰值内存
+            max_mem = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            print(f"数据分析峰值内存使用: {max_mem:.2f} MB")
+        exit(0)
     
     if args.mode == 'train':
         # 获取PEFT和训练配置

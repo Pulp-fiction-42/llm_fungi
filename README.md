@@ -40,6 +40,20 @@ python llm_finetune_pipeline.py --config config.yaml --mode train
 python llm_finetune_pipeline.py --config config.yaml --mode tune
 ```
 
+### 5. 运行数据分析
+
+```bash
+python llm_finetune_pipeline.py --config config.yaml --mode analyze
+```
+
+### 6. 查看分析结果
+
+```bash
+tensorboard --logdir=./tensorboard_logs/[YOUR_MODEL_NAME]/profiler
+```
+
+
+
 ## 配置文件说明
 
 配置文件分为以下几个部分：
